@@ -24,6 +24,7 @@ const TOOL_LABELS: Record<string, string> = {
   edit: "编辑文件",
   grep: "搜索",
   ls: "列目录",
+  short_fiction_run: "短篇生产",
 };
 
 export function bookKey(bookId: string | null | undefined): string {

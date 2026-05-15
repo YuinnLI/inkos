@@ -240,6 +240,14 @@ export {
   type ShortHitSalesPackage,
   type ShortHitReference,
 } from "./agents/short-hit.js";
+export {
+  runShortFictionProduction,
+  extractResponsesImageBase64,
+  resolveCoverApiKey,
+  type ShortFictionRunOptions,
+  type ShortFictionRunResult,
+  type ShortFictionRunRuntimes,
+} from "./pipeline/short-fiction-runner.js";
 
 // Agent (pi-agent integration)
 export * from "./agent/index.js";

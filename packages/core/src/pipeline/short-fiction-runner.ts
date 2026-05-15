@@ -1,0 +1,405 @@
+import { Buffer } from "node:buffer";
+import { mkdir, writeFile } from "node:fs/promises";
+import { dirname, join } from "node:path";
+import type { AgentContext } from "../agents/base.js";
+import {
+  SHORT_HIT_DEFAULT_CHAPTERS,
+  SHORT_HIT_DEFAULT_CHARS_PER_CHAPTER,
+  SHORT_HIT_MAX_CHAPTERS,
+  SHORT_HIT_MAX_CHARS_PER_CHAPTER,
+  SHORT_HIT_MIN_CHAPTERS,
+  SHORT_HIT_MIN_CHARS_PER_CHAPTER,
+  ShortHitDraftReviewerAgent,
+  ShortHitDraftReviserAgent,
+  ShortHitOutlineAgent,
+  ShortHitOutlineReviewerAgent,
+  ShortHitOutlineReviserAgent,
+  ShortHitPackagingAgent,
+  ShortHitWriterAgent,
+  renderShortHitDraftMarkdown,
+  validateShortHitDraftForFinal,
+  type ShortHitBatchDraft,
+  type ShortHitReference,
+  type ShortHitSalesPackage,
+} from "../agents/short-hit.js";
+import { safeChildPath } from "../utils/path-safety.js";
+
+export interface ShortFictionRunRuntimes {
+  readonly planner: AgentContext;
+  readonly outlineReview: AgentContext;
+  readonly writer: AgentContext;
+  readonly draftReview: AgentContext;
+  readonly revise: AgentContext;
+  readonly package: AgentContext;
+}
+
+export interface ShortFictionRunOptions {
+  readonly projectRoot: string;
+  readonly direction: string;
+  readonly runtimes: ShortFictionRunRuntimes;
+  readonly reference?: ShortHitReference;
+  readonly storyId?: string;
+  readonly outDir?: string;
+  readonly chapterCount?: number;
+  readonly charsPerChapter?: number;
+  readonly cover?: boolean;
+  readonly coverBaseUrl?: string;
+  readonly coverEndpoint?: string;
+  readonly coverModel?: string;
+  readonly coverSize?: string;
+  readonly coverApiKeyEnv?: string;
+  readonly onProgress?: (message: string) => void;
+}
+
+export interface ShortFictionRunResult {
+  readonly storyId: string;
+  readonly outlinePath: string;
+  readonly outlineReviewPath: string;
+  readonly draftReviewPath: string;
+  readonly finalMarkdownPath: string;
+  readonly finalJsonPath: string;
+  readonly salesPackagePath: string;
+  readonly coverPromptPath: string;
+  readonly coverImagePath?: string;
+  readonly coverError?: string;
+}
+
+export async function runShortFictionProduction(
+  options: ShortFictionRunOptions,
+): Promise<ShortFictionRunResult> {
+  const root = options.projectRoot;
+  const chapterCount = boundedInteger(
+    options.chapterCount,
+    SHORT_HIT_DEFAULT_CHAPTERS,
+    "chapterCount",
+    SHORT_HIT_MIN_CHAPTERS,
+    SHORT_HIT_MAX_CHAPTERS,
+  );
+  const charsPerChapter = boundedInteger(
+    options.charsPerChapter,
+    SHORT_HIT_DEFAULT_CHARS_PER_CHAPTER,
+    "charsPerChapter",
+    SHORT_HIT_MIN_CHARS_PER_CHAPTER,
+    SHORT_HIT_MAX_CHARS_PER_CHAPTER,
+  );
+
+  options.onProgress?.("Creating short fiction outline...");
+  const outlineAgent = new ShortHitOutlineAgent(options.runtimes.planner);
+  const outlineV1 = await outlineAgent.createOutline({
+    direction: options.direction,
+    chapterCount,
+    charsPerChapter,
+    reference: options.reference,
+  });
+
+  const storyId = safeSegment(options.storyId || slugify(outlineV1.storyTitle || options.direction));
+  const baseDir = join(normalizeOutputDir(options.outDir ?? "shorts"), storyId);
+  await writeText(root, join(baseDir, "outline", "v001.md"), outlineV1.rawContent);
+
+  options.onProgress?.("Reviewing outline...");
+  const outlineReviewer = new ShortHitOutlineReviewerAgent(options.runtimes.outlineReview);
+  const outlineReview = await outlineReviewer.reviewOutline({
+    direction: options.direction,
+    outline: outlineV1,
+    reference: options.reference,
+  });
+  await writeText(root, join(baseDir, "reviews", "outline-v001.md"), outlineReview);
+
+  options.onProgress?.("Revising outline once...");
+  const outlineReviser = new ShortHitOutlineReviserAgent(options.runtimes.planner);
+  const outlineV2 = await outlineReviser.reviseOutline({
+    direction: options.direction,
+    outline: outlineV1,
+    review: outlineReview,
+    reference: options.reference,
+    chapterCount,
+    charsPerChapter,
+  });
+  await writeText(root, join(baseDir, "outline", "v002.md"), outlineV2.rawContent);
+
+  options.onProgress?.("Writing full short fiction draft...");
+  const writer = new ShortHitWriterAgent(options.runtimes.writer);
+  const draftV1 = await writer.writeDraft({
+    direction: options.direction,
+    outlineMarkdown: outlineV2.rawContent,
+    chapterCount,
+    charsPerChapter,
+  });
+  await writeDraftArtifacts(root, baseDir, "v001", draftV1);
+
+  options.onProgress?.("Reviewing full draft...");
+  const draftReviewer = new ShortHitDraftReviewerAgent(options.runtimes.draftReview);
+  const draftReview = await draftReviewer.reviewDraft({
+    direction: options.direction,
+    outlineMarkdown: outlineV2.rawContent,
+    draft: draftV1,
+    chapterCount,
+    charsPerChapter,
+  });
+  await writeText(root, join(baseDir, "reviews", "draft-v001.md"), draftReview);
+
+  options.onProgress?.("Revising full draft once...");
+  const reviser = new ShortHitDraftReviserAgent(options.runtimes.revise);
+  const draftV2 = await reviser.reviseDraft({
+    direction: options.direction,
+    outlineMarkdown: outlineV2.rawContent,
+    draft: draftV1,
+    review: draftReview,
+    chapterCount,
+    charsPerChapter,
+  });
+  validateShortHitDraftForFinal(draftV2, { expectedChapters: chapterCount });
+  await writeDraftArtifacts(root, baseDir, "v002", draftV2);
+  await writeFinalArtifacts(root, baseDir, draftV2);
+
+  options.onProgress?.("Generating synopsis and cover prompt...");
+  const packager = new ShortHitPackagingAgent(options.runtimes.package);
+  const salesPackage = await packager.generatePackage({
+    direction: options.direction,
+    outlineMarkdown: outlineV2.rawContent,
+    draft: draftV2,
+  });
+  await writePackageArtifacts(root, baseDir, salesPackage);
+
+  const coverArtifacts: { readonly coverImagePath?: string; readonly coverError?: string } = options.cover === false
+    ? { coverError: "disabled" }
+    : await generateCoverArtifact({
+        root,
+        baseDir,
+        salesPackage,
+        coverBaseUrl: options.coverBaseUrl,
+        coverEndpoint: options.coverEndpoint,
+        coverModel: options.coverModel,
+        coverSize: options.coverSize,
+        coverApiKeyEnv: options.coverApiKeyEnv,
+      }).catch((error: unknown) => ({ coverError: String(error) }));
+
+  return {
+    storyId,
+    outlinePath: join(baseDir, "outline", "v002.md"),
+    outlineReviewPath: join(baseDir, "reviews", "outline-v001.md"),
+    draftReviewPath: join(baseDir, "reviews", "draft-v001.md"),
+    finalMarkdownPath: join(baseDir, "final", "full.md"),
+    finalJsonPath: join(baseDir, "final", "short-story.json"),
+    salesPackagePath: join(baseDir, "final", "sales-package.md"),
+    coverPromptPath: join(baseDir, "final", "cover-prompt.md"),
+    coverImagePath: coverArtifacts.coverImagePath,
+    coverError: coverArtifacts.coverError,
+  };
+}
+
+async function writeDraftArtifacts(
+  root: string,
+  baseDir: string,
+  version: string,
+  draft: ShortHitBatchDraft,
+): Promise<void> {
+  const draftDir = join(baseDir, "drafts", version);
+  await writeText(root, join(draftDir, "full.md"), renderShortHitDraftMarkdown(draft));
+  await writeJson(root, join(draftDir, "draft.json"), draft);
+  await Promise.all(draft.chapters.map((chapter) =>
+    writeText(root, join(draftDir, "chapters", `${String(chapter.number).padStart(4, "0")}.md`), [
+      `# 第${chapter.number}章 ${chapter.title}`,
+      "",
+      chapter.content,
+    ].join("\n")),
+  ));
+}
+
+async function writeFinalArtifacts(root: string, baseDir: string, draft: ShortHitBatchDraft): Promise<void> {
+  const finalDir = join(baseDir, "final");
+  const markdown = renderShortHitDraftMarkdown(draft);
+  await writeText(root, join(finalDir, "full.md"), markdown);
+  await writeText(root, join(finalDir, `${safeFileName(draft.storyTitle)}.md`), markdown);
+  await writeJson(root, join(finalDir, "short-story.json"), draft);
+  await Promise.all(draft.chapters.map((chapter) =>
+    writeText(root, join(finalDir, "chapters", `${String(chapter.number).padStart(4, "0")}.md`), [
+      `# 第${chapter.number}章 ${chapter.title}`,
+      "",
+      chapter.content,
+    ].join("\n")),
+  ));
+}
+
+async function writePackageArtifacts(root: string, baseDir: string, salesPackage: ShortHitSalesPackage): Promise<void> {
+  const finalDir = join(baseDir, "final");
+  await writeJson(root, join(finalDir, "sales-package.json"), salesPackage);
+  await writeText(root, join(finalDir, "sales-package.md"), [
+    `# ${salesPackage.title}`,
+    "",
+    "## 简介",
+    "",
+    salesPackage.intro,
+    "",
+    "## 卖点",
+    "",
+    ...salesPackage.sellingPoints.map((point) => `- ${point}`),
+    "",
+    "## 封面提示词",
+    "",
+    salesPackage.coverPrompt,
+  ].join("\n"));
+  await writeText(root, join(finalDir, "cover-prompt.md"), salesPackage.coverPrompt || "(empty)");
+}
+
+async function generateCoverArtifact(input: {
+  readonly root: string;
+  readonly baseDir: string;
+  readonly salesPackage: ShortHitSalesPackage;
+  readonly coverBaseUrl?: string;
+  readonly coverEndpoint?: string;
+  readonly coverModel?: string;
+  readonly coverSize?: string;
+  readonly coverApiKeyEnv?: string;
+}): Promise<{ readonly coverImagePath: string }> {
+  const endpoint = resolveCoverEndpoint(input.coverEndpoint, input.coverBaseUrl);
+  const model = input.coverModel || process.env.INKOS_COVER_MODEL || "gpt-5.5";
+  const size = input.coverSize || process.env.INKOS_COVER_SIZE || "1024x1360";
+  const apiKeyEnv = input.coverApiKeyEnv || "INKOS_COVER_API_KEY";
+  const apiKey = resolveCoverApiKey(apiKeyEnv);
+
+  const response = await fetch(endpoint, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model,
+      input: buildCoverImagePrompt(input.salesPackage),
+      tools: [{ type: "image_generation", size }],
+    }),
+  });
+  const text = await response.text();
+  if (!response.ok) {
+    throw new Error(`cover generation failed: HTTP ${response.status} ${text.slice(0, 500)}`);
+  }
+
+  let payload: unknown;
+  try {
+    payload = JSON.parse(text);
+  } catch (error) {
+    throw new Error(`cover generation returned non-JSON response: ${String(error)}`);
+  }
+
+  const imageBase64 = extractResponsesImageBase64(payload);
+  if (!imageBase64) {
+    throw new Error("cover generation response did not include image_generation_call result.");
+  }
+
+  const coverPath = join(input.baseDir, "final", "cover.png");
+  await writeBinary(input.root, coverPath, Buffer.from(imageBase64, "base64"));
+  return { coverImagePath: coverPath };
+}
+
+export function extractResponsesImageBase64(payload: unknown): string | undefined {
+  const output = (payload as { output?: unknown }).output;
+  if (!Array.isArray(output)) return undefined;
+
+  for (const item of output) {
+    const record = item as { type?: unknown; result?: unknown; content?: unknown };
+    if (record.type === "image_generation_call" && typeof record.result === "string" && record.result.trim()) {
+      return record.result.trim();
+    }
+    if (Array.isArray(record.content)) {
+      for (const contentItem of record.content) {
+        const contentRecord = contentItem as { result?: unknown; image_base64?: unknown };
+        if (typeof contentRecord.result === "string" && contentRecord.result.trim()) return contentRecord.result.trim();
+        if (typeof contentRecord.image_base64 === "string" && contentRecord.image_base64.trim()) return contentRecord.image_base64.trim();
+      }
+    }
+  }
+
+  return undefined;
+}
+
+export function resolveCoverApiKey(apiKeyEnv: string): string {
+  const apiKey = process.env[apiKeyEnv];
+  if (!apiKey) {
+    throw new Error(`Cover API key is required. Set ${apiKeyEnv} or pass coverApiKeyEnv.`);
+  }
+  return apiKey;
+}
+
+function resolveCoverEndpoint(coverEndpoint?: string, coverBaseUrl?: string): string {
+  const endpoint = coverEndpoint || process.env.INKOS_COVER_ENDPOINT;
+  if (endpoint) return endpoint;
+  const baseUrl = coverBaseUrl || process.env.INKOS_COVER_BASE_URL;
+  if (!baseUrl) {
+    throw new Error("cover endpoint is required. Set INKOS_COVER_BASE_URL or disable cover generation.");
+  }
+  return `${baseUrl.replace(/\/+$/u, "")}/responses`;
+}
+
+function buildCoverImagePrompt(salesPackage: ShortHitSalesPackage): string {
+  return [
+    "为中文商业短篇小说生成手机端平台书封，3:4竖图。",
+    `主标题：${salesPackage.title}`,
+    salesPackage.intro ? `简介：${salesPackage.intro}` : "",
+    salesPackage.sellingPoints.length > 0 ? `卖点：${salesPackage.sellingPoints.join("；")}` : "",
+    salesPackage.coverPrompt ? `包装提示：${salesPackage.coverPrompt}` : "",
+    "",
+    "封面方向：平台短篇书封，不是电影海报。标题字要成为主视觉，预留两到四行大字排版区；人物近景或半身，表情有冷笑、震惊、崩溃、压迫或反杀感；道具少而大，一眼能看出冲突。",
+    "颜色高对比、高饱和，适合手机列表缩略图。避免写实会议摄影、横版视频缩略图、杂志大片、小清新细字和长段文字。",
+    "如果模型文字不稳定，优先生成明确标题留白/字块/排版空间，不要把大量乱码文字铺满画面。",
+  ].filter(Boolean).join("\n");
+}
+
+async function writeBinary(root: string, path: string, value: Buffer): Promise<void> {
+  const resolved = safeChildPath(root, path);
+  await mkdir(dirname(resolved), { recursive: true });
+  await writeFile(resolved, value);
+}
+
+async function writeJson(root: string, path: string, value: unknown): Promise<void> {
+  await writeText(root, path, JSON.stringify(value, null, 2));
+}
+
+async function writeText(root: string, path: string, value: string): Promise<void> {
+  const resolved = safeChildPath(root, path);
+  await mkdir(dirname(resolved), { recursive: true });
+  await writeFile(resolved, `${value.trimEnd()}\n`, "utf-8");
+}
+
+function normalizeOutputDir(value: string): string {
+  const trimmed = value.trim() || "shorts";
+  safeChildPath("/", trimmed);
+  return trimmed.replace(/^\/+/u, "").replace(/\/+$/u, "") || "shorts";
+}
+
+function boundedInteger(value: number | undefined, fallback: number, name: string, min: number, max: number): number {
+  const parsed = value ?? fallback;
+  if (!Number.isInteger(parsed) || parsed < min || parsed > max) {
+    throw new Error(`${name} must be an integer between ${min} and ${max}.`);
+  }
+  return parsed;
+}
+
+function slugify(value: string): string {
+  const slug = value
+    .toLowerCase()
+    .replace(/['"]/g, "")
+    .replace(/[^\p{L}\p{N}]+/gu, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60);
+  return slug || `short-${Date.now()}`;
+}
+
+function safeSegment(value: string): string {
+  const cleaned = value
+    .replace(/[\\/:\0*?"<>|]/g, "-")
+    .replace(/\s+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 80);
+  if (!cleaned || cleaned === "." || cleaned === "..") return `short-${Date.now()}`;
+  return cleaned;
+}
+
+function safeFileName(value: string): string {
+  const cleaned = value
+    .replace(/[\\/:\0*?"<>|]/g, "_")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 80);
+  return cleaned || "short-hit";
+}

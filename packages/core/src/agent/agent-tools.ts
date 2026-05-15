@@ -10,6 +10,7 @@ import { writeExportArtifact } from "../interaction/export-artifact.js";
 import { assertSafeBookId, deriveBookIdFromTitle } from "../utils/book-id.js";
 import { safeChildPath } from "../utils/path-safety.js";
 import { normalizePlatformId, normalizePlatformOrOther } from "../models/book.js";
+import { runShortFictionProduction } from "../pipeline/short-fiction-runner.js";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -276,7 +277,106 @@ export function createSubAgentTool(
 }
 
 // ---------------------------------------------------------------------------
-// 2. Deterministic writing tools
+// 2. Standalone Short Fiction Tool
+// ---------------------------------------------------------------------------
+
+const ShortFictionRunParams = Type.Object({
+  direction: Type.String({
+    description: "Required short fiction direction, e.g. 女频短篇 婚姻背叛 证据反杀. Include genre, protagonist pressure, conflict, and desired payoff when known.",
+  }),
+  reference: Type.Optional(Type.String({
+    description: "Optional user-provided reference notes or constraints. Do not paste copyrighted source text unless the user explicitly provided it.",
+  })),
+  storyId: Type.Optional(Type.String({
+    description: "Optional output id under shorts/. Leave empty to derive from the generated title.",
+  })),
+  chapters: Type.Optional(Type.Number({
+    description: "Target complete short chapter count, 12-18. Default 12.",
+  })),
+  chars: Type.Optional(Type.Number({
+    description: "Target Chinese characters per chapter, 900-1200. Default 1000.",
+  })),
+  cover: Type.Optional(Type.Boolean({
+    description: "Whether to attempt cover image generation after synopsis and cover prompt. Default true; use false if the user only wants text assets.",
+  })),
+  coverBaseUrl: Type.Optional(Type.String({
+    description: "Optional OpenAI-compatible Responses API base URL for cover generation.",
+  })),
+  coverEndpoint: Type.Optional(Type.String({
+    description: "Optional exact Responses endpoint for cover generation. Overrides coverBaseUrl.",
+  })),
+  coverModel: Type.Optional(Type.String({
+    description: "Optional image-capable Responses model. Default gpt-5.5.",
+  })),
+  coverSize: Type.Optional(Type.String({
+    description: "Optional image size, default 1024x1360.",
+  })),
+  coverApiKeyEnv: Type.Optional(Type.String({
+    description: "Optional env var containing the cover API key. Default INKOS_COVER_API_KEY.",
+  })),
+});
+
+type ShortFictionRunParamsType = Static<typeof ShortFictionRunParams>;
+
+export function createShortFictionRunTool(
+  pipeline: PipelineRunner,
+  projectRoot: string,
+): AgentTool<typeof ShortFictionRunParams> {
+  return {
+    name: "short_fiction_run",
+    description:
+      "Create a standalone short fiction project from a direction. " +
+      "Runs outline -> outline review/revision -> full draft -> draft review/revision -> synopsis/selling points/cover prompt -> optional cover image. " +
+      "Uses the user's direction and optional reference notes as input.",
+    label: "Short Fiction",
+    parameters: ShortFictionRunParams,
+    async execute(
+      _toolCallId: string,
+      params: ShortFictionRunParamsType,
+      _signal?: AbortSignal,
+      onUpdate?: AgentToolUpdateCallback,
+    ): Promise<AgentToolResult<unknown>> {
+      const progress = (message: string) => onUpdate?.(textResult(message));
+      const result = await runShortFictionProduction({
+        projectRoot,
+        direction: params.direction,
+        runtimes: {
+          planner: pipeline.createAgentContext("short-outline"),
+          outlineReview: pipeline.createAgentContext("short-outline-review"),
+          writer: pipeline.createAgentContext("short-writer"),
+          draftReview: pipeline.createAgentContext("short-draft-review"),
+          revise: pipeline.createAgentContext("short-revise"),
+          package: pipeline.createAgentContext("short-package"),
+        },
+        ...(params.reference ? { reference: { text: params.reference } } : {}),
+        storyId: params.storyId,
+        chapterCount: params.chapters,
+        charsPerChapter: params.chars,
+        cover: params.cover,
+        coverBaseUrl: params.coverBaseUrl,
+        coverEndpoint: params.coverEndpoint,
+        coverModel: params.coverModel,
+        coverSize: params.coverSize,
+        coverApiKeyEnv: params.coverApiKeyEnv,
+        onProgress: progress,
+      });
+
+      return textResult(
+        [
+          `Short fiction "${result.storyId}" completed.`,
+          `Final: ${result.finalMarkdownPath}`,
+          `Sales package: ${result.salesPackagePath}`,
+          `Cover prompt: ${result.coverPromptPath}`,
+          result.coverImagePath ? `Cover image: ${result.coverImagePath}` : `Cover image: skipped (${result.coverError ?? "not generated"})`,
+        ].join("\n"),
+        { kind: "short_fiction_created", ...result },
+      );
+    },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 3. Deterministic writing tools
 // ---------------------------------------------------------------------------
 
 const WriteTruthFileParams = Type.Object({

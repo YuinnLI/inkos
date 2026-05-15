@@ -6,6 +6,7 @@ import { StateManager } from "../state/manager.js";
 import {
   createReadTool,
   createSubAgentTool,
+  createShortFictionRunTool,
   createPatchChapterTextTool,
   createRenameEntityTool,
   createWriteFileTool,
@@ -220,6 +221,21 @@ describe("agent deterministic writing tools", () => {
     if (result.content[0]?.type === "text") {
       expect(result.content[0].text).toContain("No active book");
     }
+  });
+
+  it("exposes a standalone short fiction tool without benchmark inputs", () => {
+    const pipeline = {
+      createAgentContext: vi.fn(),
+    };
+    const tool = createShortFictionRunTool(pipeline as never, root);
+    const schemaText = JSON.stringify(tool.parameters);
+    const toolText = JSON.stringify({ description: tool.description, parameters: tool.parameters });
+
+    expect(tool.name).toBe("short_fiction_run");
+    expect(schemaText).toContain("direction");
+    expect(schemaText).toContain("coverModel");
+    expect(toolText).not.toContain("benchmark");
+    expect(toolText).not.toContain("deconstruction");
   });
 
   it("allows architect revise mode to use the active book", async () => {
