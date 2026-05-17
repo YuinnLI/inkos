@@ -2387,6 +2387,103 @@ describe("createStudioServer daemon lifecycle", () => {
     );
   });
 
+  it("handles explicit chat chapter edits outside the InkOS writing agent", async () => {
+    loadChapterIndexMock.mockResolvedValueOnce([{
+      number: 3,
+      title: "Demo",
+      status: "ready-for-review",
+      wordCount: 4,
+      createdAt: "2026-04-12T00:00:00.000Z",
+      updatedAt: "2026-04-12T00:00:00.000Z",
+      auditIssues: [],
+      lengthWarnings: [],
+    }]);
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "第3章把「Body」改成「Body updated」",
+        activeBookId: "demo-book",
+        sessionId: "agent-session-1",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      response: expect.stringContaining("已直接编辑 demo-book 第 3 章"),
+      session: {
+        sessionId: "agent-session-1",
+        activeBookId: "demo-book",
+      },
+    });
+    await expect(readFile(join(root, "books", "demo-book", "chapters", "0003_Demo.md"), "utf-8"))
+      .resolves.toContain("Body updated");
+    expect(saveChapterIndexMock).toHaveBeenCalledWith("demo-book", [
+      expect.objectContaining({
+        number: 3,
+        status: "audit-failed",
+        wordCount: expect.any(Number),
+        auditIssues: expect.arrayContaining(["[warning] Chat external edit requires review before continuation."]),
+      }),
+    ]);
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
+    expect(writeNextChapterMock).not.toHaveBeenCalled();
+  });
+
+  it("handles explicit chat artifact edits only for content roots", async () => {
+    await mkdir(join(root, "covers", "demo"), { recursive: true });
+    await writeFile(join(root, "covers", "demo", "cover-prompt.md"), "标题字太小。\n", "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "把 covers/demo/cover-prompt.md 里的「标题字太小」改成「标题字压到最大」",
+        sessionId: "agent-session-1",
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    await expect(response.json()).resolves.toMatchObject({
+      response: expect.stringContaining("已直接编辑 covers/demo/cover-prompt.md"),
+    });
+    await expect(readFile(join(root, "covers", "demo", "cover-prompt.md"), "utf-8"))
+      .resolves.toContain("标题字压到最大");
+    expect(saveChapterIndexMock).not.toHaveBeenCalled();
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects chat artifact edits against source files instead of routing to the agent", async () => {
+    await mkdir(join(root, "packages", "core", "src"), { recursive: true });
+    await writeFile(join(root, "packages", "core", "src", "index.ts"), "export const value = 1;\n", "utf-8");
+
+    const { createStudioServer } = await import("./server.js");
+    const app = createStudioServer(cloneProjectConfig() as never, root);
+
+    const response = await app.request("http://localhost/api/v1/agent", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        instruction: "把 packages/core/src/index.ts 里的「value」改成「other」",
+        sessionId: "agent-session-1",
+      }),
+    });
+
+    expect(response.status).toBe(400);
+    const body = await response.json() as { error: { code: string } };
+    expect(body.error.code).toBe("UNSUPPORTED_CHAT_EDIT_TARGET");
+    await expect(readFile(join(root, "packages", "core", "src", "index.ts"), "utf-8"))
+      .resolves.toContain("value");
+    expect(runAgentSessionMock).not.toHaveBeenCalled();
+  });
+
   it("rejects unsafe activeBookId in the Studio agent API", async () => {
     const { createStudioServer } = await import("./server.js");
     const app = createStudioServer(cloneProjectConfig() as never, root);

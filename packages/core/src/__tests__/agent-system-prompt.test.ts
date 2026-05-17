@@ -70,10 +70,10 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("rename_entity");
       expect(prompt).toContain("patch_chapter_text");
       expect(prompt).toContain("short_fiction_run");
-      expect(prompt).toContain("edit");
-      expect(prompt).toContain("write");
       expect(prompt).toContain("grep");
       expect(prompt).toContain("ls");
+      expect(prompt).not.toContain("**edit**");
+      expect(prompt).not.toContain("**write**");
     });
 
     it("Chinese prompt does NOT mention revise_chapter (merged into sub_agent reviser)", () => {
@@ -92,7 +92,8 @@ describe("buildAgentSystemPrompt", () => {
       expect(prompt).toContain("write_truth_file");
       expect(prompt).toContain("用户要求重写/精修已有章节");
       expect(prompt).toContain("reviser");
-      expect(prompt).toContain("edit / write 是高权限兜底工具");
+      expect(prompt).toContain("直接编辑已有文本");
+      expect(prompt).not.toContain("edit / write 是高权限兜底工具");
     });
 
     it("with-book prompt routes cover prompt edits to generate_cover", () => {
@@ -108,8 +109,8 @@ describe("buildAgentSystemPrompt", () => {
       const prompt = buildAgentSystemPrompt("my-book", "zh");
       expect(prompt).toContain("当前书由 session 绑定");
       expect(prompt).toContain("业务工具不要传其他 bookId");
-      expect(prompt).toContain("raw file tools");
-      expect(prompt).toContain("高权限兜底");
+      expect(prompt).not.toContain("raw file tools");
+      expect(prompt).not.toContain("高权限兜底");
     });
 
     it("with-book prompt names Phase 5 canonical truth paths", () => {
@@ -133,8 +134,8 @@ describe("buildAgentSystemPrompt", () => {
       const prompt = buildAgentSystemPrompt("novel", "en");
       expect(prompt).toContain("The active book is session-bound");
       expect(prompt).toContain("Do not pass another bookId");
-      expect(prompt).toContain("raw file tools");
-      expect(prompt).toContain("high-privilege fallback");
+      expect(prompt).not.toContain("raw file tools");
+      expect(prompt).not.toContain("high-privilege fallback");
     });
 
     it("Chinese with-book prompt forbids emoji", () => {
